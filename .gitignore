@@ -54,3 +54,8 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Frontend build & dependencies
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo

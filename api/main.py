@@ -1,40 +1,77 @@
-"""FastAPI web server and interactive dashboard for Crypto Volatility Forecaster.
+"""FastAPI web server and REST API for Algorithmic Crypto Volatility Forecaster.
 
-Provides RESTful endpoints and serves a local interactive UI on http://localhost:8000.
+Provides RESTful analytical endpoints and serves the React quantitative workstation UI.
 """
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src.data.market_data import fetch_market_data
-from src.features.feature_fusion import fuse_market_and_sentiment_features
-from src.features.market_features import compute_market_features
-from src.models.baseline import CryptoVolatilityForecaster
-from src.nlp.finbert_sentiment import FinBERTSentimentAnalyzer
-from src.nlp.sentiment_aggregation import aggregate_hourly_sentiment, generate_sample_social_posts
-from src.utils.config import PROCESSED_DIR, RAW_MARKET_DIR, SAVED_MODELS_DIR, PROJECT_ROOT
+from api.data_service import (
+    DATASET_REGISTRY,
+    _cache_key,
+    _classify_sentiment,
+    df_to_clean_records,
+    get_backtest_full_data,
+    get_market_overview_data,
+    get_models_details_data,
+    get_sentiment_overview_data,
+    get_system_health_data,
+    list_datasets_metadata,
+    load_sentiment_cache,
+    preview_dataset,
+)
+from src.utils.config import (
+    PROCESSED_DIR,
+    PROJECT_ROOT,
+    RAW_MARKET_DIR,
+    SAVED_MODELS_DIR,
+    VOLATILITY_HORIZON_HOURS,
+)
 from src.utils.logger import get_logger
 
-import joblib
-import torch
-from src.models.deep_models import CryptoGRU, CryptoLSTM
+try:
+    import joblib
+except ImportError:  # pragma: no cover - optional in lightweight API mode
+    joblib = None
+
+try:
+    import torch
+    from src.models.deep_models import CryptoGRU, CryptoLSTM
+except ImportError:  # pragma: no cover - optional in lightweight API mode
+    torch = None
+    CryptoGRU = None
+    CryptoLSTM = None
+
+try:
+    from src.models.baseline import CryptoVolatilityForecaster
+except ImportError:  # pragma: no cover
+    CryptoVolatilityForecaster = None
+
+try:
+    from src.nlp.finbert_sentiment import FinBERTSentimentAnalyzer
+except ImportError:  # pragma: no cover
+    FinBERTSentimentAnalyzer = None
 
 logger = get_logger("APIServer")
 
+FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
+
 # Global instances loaded on startup
-sentiment_analyzer: Optional[FinBERTSentimentAnalyzer] = None
-forecaster_model: Optional[CryptoVolatilityForecaster] = None
-lstm_model: Optional[CryptoLSTM] = None
-gru_model: Optional[CryptoGRU] = None
+sentiment_analyzer: Optional[Any] = None
+forecaster_model: Optional[Any] = None
+lstm_model: Optional[Any] = None
+gru_model: Optional[Any] = None
 seq_scaler_meta: Optional[Dict] = None
+last_pipeline_run: Optional[str] = None
 
 
 @asynccontextmanager
@@ -42,44 +79,46 @@ async def lifespan(app: FastAPI):
     """Initializes models and resources on server startup."""
     global sentiment_analyzer, forecaster_model, lstm_model, gru_model, seq_scaler_meta
     logger.info("Initializing FinBERT analyzer and forecasting models...")
-    try:
-        sentiment_analyzer = FinBERTSentimentAnalyzer(enable_cache=True)
-    except Exception as e:
-        logger.warning("Could not initialize FinBERT analyzer: %s", str(e))
+
+    if FinBERTSentimentAnalyzer is not None:
+        try:
+            sentiment_analyzer = FinBERTSentimentAnalyzer(enable_cache=True)
+        except Exception as e:
+            logger.warning("Could not initialize FinBERT analyzer: %s", str(e))
 
     # Load Ridge baseline
     model_path = SAVED_MODELS_DIR / "baseline_ridge.joblib"
-    if model_path.exists():
+    if model_path.exists() and CryptoVolatilityForecaster is not None:
         try:
             forecaster_model = CryptoVolatilityForecaster.load(model_path)
             logger.info("Forecaster Ridge model loaded successfully.")
         except Exception as e:
             logger.warning("Failed to load baseline model: %s", str(e))
 
-    # Load sequence scaler
+    # Load sequence scaler and PyTorch models
     scaler_path = SAVED_MODELS_DIR / "sequence_scaler.joblib"
-    if scaler_path.exists():
+    if scaler_path.exists() and joblib is not None:
         try:
             seq_scaler_meta = joblib.load(scaler_path)
             in_dim = len(seq_scaler_meta["feature_cols"])
 
-            # Load LSTM
-            lstm_path = SAVED_MODELS_DIR / "best_crypto_lstm.pt"
-            if lstm_path.exists():
-                lstm_model = CryptoLSTM(input_size=in_dim, hidden_size=64, num_layers=2)
-                ckpt = torch.load(lstm_path, map_location="cpu")
-                lstm_model.load_state_dict(ckpt["model_state_dict"])
-                lstm_model.eval()
-                logger.info("Loaded PyTorch CryptoLSTM model.")
+            if torch is not None and CryptoLSTM is not None:
+                lstm_path = SAVED_MODELS_DIR / "best_crypto_lstm.pt"
+                if lstm_path.exists():
+                    lstm_model = CryptoLSTM(input_size=in_dim, hidden_size=64, num_layers=2)
+                    ckpt = torch.load(lstm_path, map_location="cpu")
+                    lstm_model.load_state_dict(ckpt["model_state_dict"])
+                    lstm_model.eval()
+                    logger.info("Loaded PyTorch CryptoLSTM model.")
 
-            # Load GRU
-            gru_path = SAVED_MODELS_DIR / "best_crypto_gru.pt"
-            if gru_path.exists():
-                gru_model = CryptoGRU(input_size=in_dim, hidden_size=64, num_layers=2)
-                ckpt = torch.load(gru_path, map_location="cpu")
-                gru_model.load_state_dict(ckpt["model_state_dict"])
-                gru_model.eval()
-                logger.info("Loaded PyTorch CryptoGRU model.")
+            if torch is not None and CryptoGRU is not None:
+                gru_path = SAVED_MODELS_DIR / "best_crypto_gru.pt"
+                if gru_path.exists():
+                    gru_model = CryptoGRU(input_size=in_dim, hidden_size=64, num_layers=2)
+                    ckpt = torch.load(gru_path, map_location="cpu")
+                    gru_model.load_state_dict(ckpt["model_state_dict"])
+                    gru_model.eval()
+                    logger.info("Loaded PyTorch CryptoGRU model.")
         except Exception as e:
             logger.warning("Error loading deep models: %s", str(e))
 
@@ -112,96 +151,31 @@ class PipelineRunRequest(BaseModel):
     limit: int = 100
 
 
-@app.get("/api/status")
-def get_system_status() -> Dict:
-    """Returns system status, active models, and dataset shapes."""
-    aligned_file = PROCESSED_DIR / "aligned_features.csv"
-    aligned_rows = 0
-    if aligned_file.exists():
-        try:
-            aligned_rows = len(pd.read_csv(aligned_file))
-        except Exception:
-            pass
-
+def _available_models_map() -> Dict[str, bool]:
     return {
-        "status": "online",
-        "model_loaded": forecaster_model is not None and forecaster_model.is_trained,
-        "finbert_active": sentiment_analyzer is not None,
-        "aligned_dataset_rows": aligned_rows,
-        "exchange": "Binance CCXT",
-        "trading_pair": "BTC/USDT",
-        "timeframe": "1h",
-        "forecast_horizon": "4 hours",
+        "gru": gru_model is not None,
+        "lstm": lstm_model is not None,
+        "ridge": forecaster_model is not None and bool(getattr(forecaster_model, "is_trained", False)),
+        "persistence": True,
     }
 
 
-@app.get("/api/market/latest")
-def get_latest_market_data(limit: int = 48) -> Dict:
-    """Returns recent market candles and technical features."""
-    market_file = PROCESSED_DIR / "market_features.csv"
-    if not market_file.exists():
-        market_file = RAW_MARKET_DIR / "btc_usdt_1h.csv"
-        if not market_file.exists():
-            raise HTTPException(status_code=404, detail="Market data not found. Run pipeline first.")
-
-    df = pd.read_csv(market_file)
-    recent = df.tail(limit).to_dict(orient="records")
-    return {"count": len(recent), "records": recent}
-
-
-@app.post("/api/sentiment/analyze")
-def analyze_headline(req: HeadlineRequest) -> Dict:
-    """Performs real-time FinBERT sentiment analysis on input text."""
-    if not req.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
-
-    global sentiment_analyzer
-    if sentiment_analyzer is None:
-        sentiment_analyzer = FinBERTSentimentAnalyzer()
-
-    result = sentiment_analyzer.predict_single(req.text)
-    return {
-        "text": req.text,
-        "probabilities": {
-            "positive": result["positive"],
-            "negative": result["negative"],
-            "neutral": result["neutral"],
-        },
-        "sentiment_score": result["sentiment_score"],
-        "label": (
-            "Bullish (Positive)"
-            if result["sentiment_score"] > 0.15
-            else "Bearish (Negative)"
-            if result["sentiment_score"] < -0.15
-            else "Neutral"
-        ),
-    }
-
-
-@app.get("/api/predict/volatility")
-def predict_current_volatility(model: str = "gru") -> Dict:
-    """Forecasts next-4-hour realized volatility using latest aligned features."""
-    global forecaster_model
-    aligned_file = PROCESSED_DIR / "aligned_features.csv"
-    if not aligned_file.exists():
-        raise HTTPException(status_code=404, detail="Aligned feature dataset not found.")
-
-    df = pd.read_csv(aligned_file)
-    if df.empty:
-        raise HTTPException(status_code=400, detail="Aligned feature dataset is empty.")
-
+def _predict_row_volatility(df: pd.DataFrame, model: str = "gru") -> Dict[str, Any]:
+    """Predicts next-4h volatility from the latest row/sequence in aligned_features."""
     latest_row = df.iloc[-1]
     hist_vol = float(latest_row.get("volatility_24h", 0.0))
+    hist_vol_12h = float(latest_row.get("volatility_12h", 0.0))
     current_price = float(latest_row.get("close", 0.0))
 
-    # Determine which model to use
     selected_model_name = model.lower()
-    forecast_val = None
+    forecast_val: Optional[float] = None
+    active_model = ""
+    fallback_used = False
 
-    if selected_model_name in ("gru", "lstm") and seq_scaler_meta is not None:
+    if selected_model_name in ("gru", "lstm") and seq_scaler_meta is not None and torch is not None:
         seq_len = seq_scaler_meta.get("seq_len", 12)
         feature_cols = seq_scaler_meta.get("feature_cols", [])
-        if len(df) >= seq_len:
+        if len(df) >= seq_len and all(c in df.columns for c in feature_cols):
             seq_window = df[feature_cols].tail(seq_len).values
             scaler = seq_scaler_meta["scaler"]
             seq_scaled = scaler.transform(seq_window)
@@ -216,37 +190,282 @@ def predict_current_volatility(model: str = "gru") -> Dict:
                     active_model = "CryptoLSTM (Deep Learning)"
 
     if forecast_val is None:
-        # Fallback to Ridge or latest volatility
+        if selected_model_name in ("gru", "lstm"):
+            fallback_used = True
         feature_cols = (
             forecaster_model.feature_cols
-            if (forecaster_model and forecaster_model.is_trained)
-            else seq_scaler_meta.get("feature_cols", []) if seq_scaler_meta else []
+            if (forecaster_model is not None and getattr(forecaster_model, "is_trained", False))
+            else seq_scaler_meta.get("feature_cols", [])
+            if seq_scaler_meta
+            else []
         )
-        if forecaster_model and forecaster_model.is_trained and feature_cols:
+        if (
+            forecaster_model is not None
+            and getattr(forecaster_model, "is_trained", False)
+            and feature_cols
+            and all(c in df.columns for c in feature_cols)
+        ):
             feat_vals = np.array([float(latest_row[col]) for col in feature_cols]).reshape(1, -1)
-            forecast_val = forecaster_model.predict(feat_vals)
+            forecast_val = float(forecaster_model.predict(feat_vals))
             active_model = "Ridge Regressor (Baseline)"
         else:
+            if selected_model_name == "ridge":
+                fallback_used = True
             forecast_val = hist_vol
             active_model = "Historical Rolling Persistence"
 
-    forecast_val = max(0.0, forecast_val)
+    forecast_val = max(0.0, float(forecast_val))
+    regime = (
+        "High Volatility"
+        if forecast_val > 0.015
+        else "Moderate Volatility"
+        if forecast_val > 0.006
+        else "Low / Compression"
+    )
 
     return {
         "timestamp": str(latest_row.get("timestamp", "")),
+        "model_requested": selected_model_name,
         "model_used": active_model,
+        "fallback_used": fallback_used,
+        "available_models": _available_models_map(),
+        "horizon_hours": VOLATILITY_HORIZON_HOURS,
         "current_price": current_price,
         "historical_24h_volatility": round(hist_vol, 6),
+        "historical_12h_volatility": round(hist_vol_12h, 6),
         "forecast_next_4h_volatility": round(forecast_val, 6),
-        "volatility_regime": (
-            "High Volatility"
-            if forecast_val > 0.015
-            else "Moderate Volatility"
-            if forecast_val > 0.006
-            else "Low / Compression"
-        ),
+        "volatility_regime": regime,
         "latest_sentiment_score": float(latest_row.get("avg_sentiment", 0.0)),
         "rsi_14": float(latest_row.get("rsi_14", 50.0)),
+        "latest_features": {
+            col: (None if pd.isna(latest_row[col]) else (str(latest_row[col]) if isinstance(latest_row[col], str) else float(latest_row[col])))
+            for col in df.columns
+            if col != "timestamp" and col != "data_source"
+        },
+        "data_source": str(latest_row.get("data_source", "unknown")),
+    }
+
+
+@app.get("/api/status")
+def get_system_status() -> Dict:
+    """Returns system status, active models, and dataset shapes."""
+    aligned_file = PROCESSED_DIR / "aligned_features.csv"
+    market_file = PROCESSED_DIR / "market_features.csv"
+    aligned_rows = 0
+    market_rows = 0
+    latest_timestamp = None
+    data_source = None
+
+    if aligned_file.exists():
+        try:
+            adf = pd.read_csv(aligned_file)
+            aligned_rows = len(adf)
+            if not adf.empty:
+                latest_timestamp = str(adf.iloc[-1].get("timestamp", ""))
+                data_source = str(adf.iloc[-1].get("data_source", ""))
+        except Exception:
+            pass
+
+    if market_file.exists():
+        try:
+            mdf = pd.read_csv(market_file)
+            market_rows = len(mdf)
+            if latest_timestamp is None and not mdf.empty:
+                latest_timestamp = str(mdf.iloc[-1].get("timestamp", ""))
+                data_source = str(mdf.iloc[-1].get("data_source", ""))
+        except Exception:
+            pass
+
+    return {
+        "status": "online",
+        "model_loaded": forecaster_model is not None and bool(getattr(forecaster_model, "is_trained", False)),
+        "available_models": _available_models_map(),
+        "finbert_active": sentiment_analyzer is not None,
+        "finbert_fallback": bool(getattr(sentiment_analyzer, "is_fallback", False)) if sentiment_analyzer else False,
+        "aligned_dataset_rows": aligned_rows,
+        "market_dataset_rows": market_rows,
+        "latest_timestamp": latest_timestamp,
+        "data_source": data_source,
+        "last_pipeline_run": last_pipeline_run,
+        "exchange": "Binance CCXT",
+        "trading_pair": "BTC/USDT",
+        "timeframe": "1h",
+        "forecast_horizon": "4 hours",
+    }
+
+
+@app.get("/api/market/latest")
+def get_latest_market_data(limit: int = Query(default=100, ge=1, le=1000)) -> Dict:
+    """Returns recent market candles, technical features, and 24h summary."""
+    data = get_market_overview_data(limit=limit)
+    if not data["exists"]:
+        raise HTTPException(status_code=404, detail="Market data not found. Run pipeline first.")
+    return {
+        "count": data["count"],
+        "total_available": data["total_available"],
+        "summary": data["summary"],
+        "records": data["records"],
+    }
+
+
+@app.post("/api/sentiment/analyze")
+def analyze_headline(req: HeadlineRequest) -> Dict:
+    """Performs real-time FinBERT sentiment analysis on input text (with cache fallback)."""
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+    global sentiment_analyzer
+    if sentiment_analyzer is None and FinBERTSentimentAnalyzer is not None:
+        try:
+            sentiment_analyzer = FinBERTSentimentAnalyzer()
+        except Exception as e:
+            logger.warning("Failed to lazy-load FinBERT: %s", str(e))
+
+    if sentiment_analyzer is not None:
+        result = sentiment_analyzer.predict_single(text)
+        source_mode = "rule_fallback" if getattr(sentiment_analyzer, "is_fallback", False) else "finbert"
+    else:
+        cache = load_sentiment_cache()
+        cached = cache.get(_cache_key(text))
+        if cached is None:
+            raise HTTPException(
+                status_code=503,
+                detail="FinBERT runtime dependencies (torch/transformers) are not installed in this environment, and the input text is not in the local sentiment cache.",
+            )
+        result = cached
+        source_mode = "cache"
+
+    score = float(result["sentiment_score"])
+    return {
+        "text": text,
+        "source_mode": source_mode,
+        "probabilities": {
+            "positive": float(result["positive"]),
+            "negative": float(result["negative"]),
+            "neutral": float(result["neutral"]),
+        },
+        "sentiment_score": score,
+        "label": (
+            "Bullish (Positive)"
+            if score > 0.15
+            else "Bearish (Negative)"
+            if score < -0.15
+            else "Neutral"
+        ),
+    }
+
+
+@app.get("/api/sentiment/overview")
+def get_sentiment_overview(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    sentiment: str = Query(default="all"),
+    search: str = Query(default=""),
+) -> Dict:
+    """Returns hourly FinBERT sentiment time series and scored headline records."""
+    return get_sentiment_overview_data(
+        limit=limit,
+        offset=offset,
+        sentiment_filter=sentiment,
+        search=search,
+    )
+
+
+@app.get("/api/predict/volatility")
+def predict_current_volatility(model: str = "gru") -> Dict:
+    """Forecasts next-4-hour realized volatility using latest aligned features."""
+    aligned_file = PROCESSED_DIR / "aligned_features.csv"
+    if not aligned_file.exists():
+        raise HTTPException(status_code=404, detail="Aligned feature dataset not found.")
+
+    df = pd.read_csv(aligned_file)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Aligned feature dataset is empty.")
+
+    return _predict_row_volatility(df, model=model)
+
+
+@app.get("/api/forecast/series")
+def get_forecast_series(
+    limit: int = Query(default=72, ge=1, le=500),
+    model: str = Query(default="gru"),
+) -> Dict:
+    """Returns aligned historical volatility, 4h target volatility, and model predictions."""
+    aligned_file = PROCESSED_DIR / "aligned_features.csv"
+    if not aligned_file.exists():
+        raise HTTPException(status_code=404, detail="Aligned feature dataset not found.")
+
+    df = pd.read_csv(aligned_file)
+    if df.empty:
+        return {"records": [], "total_available": 0, "prediction_available": False}
+
+    n_total = len(df)
+    train_end = int(n_total * 0.70)
+    val_end = int(n_total * 0.85)
+
+    splits = []
+    for idx in range(n_total):
+        if idx < train_end:
+            splits.append("train")
+        elif idx < val_end:
+            splits.append("val")
+        else:
+            splits.append("test")
+    df["split"] = splits
+
+    # Generate historical model predictions if a trained model is loaded
+    pred_col = [None] * n_total
+    pred_model_used = None
+    selected = model.lower()
+
+    if selected in ("gru", "lstm") and seq_scaler_meta is not None and torch is not None:
+        net = gru_model if selected == "gru" else lstm_model
+        if net is not None:
+            seq_len = seq_scaler_meta.get("seq_len", 12)
+            feature_cols = seq_scaler_meta.get("feature_cols", [])
+            if all(c in df.columns for c in feature_cols) and n_total >= seq_len:
+                scaled = seq_scaler_meta["scaler"].transform(df[feature_cols].values)
+                with torch.no_grad():
+                    for idx in range(seq_len - 1, n_total):
+                        win = scaled[idx - seq_len + 1 : idx + 1]
+                        t_in = torch.tensor(win.reshape(1, seq_len, -1), dtype=torch.float32)
+                        pred_col[idx] = round(max(0.0, float(net(t_in).cpu().numpy().flatten()[0])), 6)
+                pred_model_used = f"Crypto{selected.upper()}"
+
+    if pred_model_used is None and forecaster_model is not None and getattr(forecaster_model, "is_trained", False):
+        f_cols = forecaster_model.feature_cols
+        if all(c in df.columns for c in f_cols):
+            for idx in range(n_total):
+                vec = df.iloc[idx][f_cols].values.astype(float).reshape(1, -1)
+                pred_col[idx] = round(float(forecaster_model.predict(vec)), 6)
+            pred_model_used = "Ridge Regressor"
+
+    df["predicted_volatility"] = pred_col
+    cols_to_keep = [
+        "timestamp",
+        "close",
+        "log_return",
+        "volatility_12h",
+        "volatility_24h",
+        "target_future_volatility",
+        "predicted_volatility",
+        "avg_sentiment",
+        "sentiment_shock",
+        "split",
+    ]
+    available_cols = [c for c in cols_to_keep if c in df.columns]
+    sliced = df[available_cols].tail(limit)
+    current_forecast = _predict_row_volatility(df, model=model)
+
+    return {
+        "total_available": n_total,
+        "count": len(sliced),
+        "prediction_model_used": pred_model_used,
+        "horizon_hours": VOLATILITY_HORIZON_HOURS,
+        "target_formula": "sqrt(sum_{k=1..4} r_{t+k}^2)",
+        "current_forecast": current_forecast,
+        "records": df_to_clean_records(sliced),
     }
 
 
@@ -255,9 +474,13 @@ def get_model_benchmarks() -> Dict:
     """Returns test set evaluation metrics across all trained models."""
     bench_file = PROCESSED_DIR / "model_benchmark_results.csv"
     if not bench_file.exists():
-        return {"status": "pending", "records": []}
+        return {"status": "pending", "split_info": "Held-Out 15% Test Split", "records": []}
     df = pd.read_csv(bench_file)
-    return {"status": "available", "records": df.to_dict(orient="records")}
+    return {
+        "status": "available",
+        "split_info": "Held-Out 15% Test Split (70% Train / 15% Val / 15% Test)",
+        "records": df_to_clean_records(df),
+    }
 
 
 @app.get("/api/ablation")
@@ -265,19 +488,80 @@ def get_ablation_results() -> Dict:
     """Returns multimodal ablation study results and feature importance ranking."""
     abl_file = PROCESSED_DIR / "ablation_study_results.csv"
     imp_file = PROCESSED_DIR / "feature_importance.csv"
-    abl_records = pd.read_csv(abl_file).to_dict(orient="records") if abl_file.exists() else []
-    imp_records = pd.read_csv(imp_file).to_dict(orient="records") if imp_file.exists() else []
-    return {"status": "available", "ablation": abl_records, "feature_importance": imp_records}
+    abl_records = df_to_clean_records(pd.read_csv(abl_file)) if abl_file.exists() else []
+    imp_records = df_to_clean_records(pd.read_csv(imp_file)) if imp_file.exists() else []
+    return {
+        "status": "available",
+        "split_info": "Chronological 80/20 Split (Ridge Regressor)",
+        "ablation": abl_records,
+        "feature_importance": imp_records,
+    }
+
+
+@app.get("/api/models/details")
+def get_models_details() -> Dict:
+    """Returns model architectures, checkpoint availability, and hyperparameter tuning logs."""
+    return get_models_details_data()
 
 
 @app.get("/api/backtest")
-def get_backtest_results() -> Dict:
-    """Returns volatility targeting portfolio backtest metrics and equity curve."""
-    sum_file = PROCESSED_DIR / "backtest_summary.csv"
-    eq_file = PROCESSED_DIR / "backtest_equity_curve.csv"
-    summary = pd.read_csv(sum_file).iloc[0].to_dict() if sum_file.exists() else {}
-    equity = pd.read_csv(eq_file).tail(30).to_dict(orient="records") if eq_file.exists() else []
-    return {"status": "available", "summary": summary, "equity_curve": equity}
+def get_backtest_results(limit: int = Query(default=500, ge=1, le=2000)) -> Dict:
+    """Returns volatility targeting portfolio backtest metrics and full equity curve."""
+    return get_backtest_full_data(limit=limit)
+
+
+@app.get("/api/data/datasets")
+def get_datasets_inventory() -> Dict:
+    """Lists all datasets with schema, row counts, missingness, and time ranges."""
+    return {"datasets": list_datasets_metadata()}
+
+
+@app.get("/api/data/preview")
+def get_dataset_preview(
+    dataset: str = Query(default="aligned_features"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    search: str = Query(default=""),
+    sort_by: str = Query(default=""),
+    sort_dir: str = Query(default="desc"),
+) -> Dict:
+    """Returns paginated, searchable rows from a registered dataset."""
+    try:
+        return preview_dataset(
+            dataset_id=dataset,
+            page=page,
+            page_size=page_size,
+            search=search,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    except KeyError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+
+
+@app.get("/api/data/export")
+def export_dataset_csv(dataset: str = Query(default="aligned_features")):
+    """Streams a registered dataset as a CSV file download."""
+    if dataset not in DATASET_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown dataset '{dataset}'")
+    path: Path = DATASET_REGISTRY[dataset]["path"]
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Dataset file does not exist.")
+    return FileResponse(path, media_type="text/csv", filename=path.name)
+
+
+@app.get("/api/system/health")
+def get_system_health() -> Dict:
+    """Returns genuine backend diagnostics, package availability, and artifact health."""
+    runtime_state = {
+        "available_models": _available_models_map(),
+        "finbert_active": sentiment_analyzer is not None,
+        "finbert_fallback": bool(getattr(sentiment_analyzer, "is_fallback", False)) if sentiment_analyzer else False,
+        "last_pipeline_run": last_pipeline_run,
+    }
+    return get_system_health_data(runtime_state)
 
 
 @app.get("/api/report")
@@ -286,6 +570,7 @@ def get_academic_report() -> Dict:
     report_file = PROJECT_ROOT / "FINAL_PROJECT_REPORT.md"
     if not report_file.exists():
         from src.utils.report_generator import compile_academic_report
+
         compile_academic_report()
 
     report_text = report_file.read_text(encoding="utf-8") if report_file.exists() else ""
@@ -313,13 +598,29 @@ def get_report_chart(chart_name: str):
 @app.post("/api/pipeline/run")
 def trigger_pipeline_refresh(req: PipelineRunRequest) -> Dict:
     """Refreshes market data, FinBERT sentiment, and feature fusion."""
+    global sentiment_analyzer, forecaster_model, last_pipeline_run
+    try:
+        from src.data.market_data import fetch_market_data
+        from src.features.feature_fusion import fuse_market_and_sentiment_features
+        from src.features.market_features import compute_market_features
+        from src.nlp.sentiment_aggregation import aggregate_hourly_sentiment, generate_sample_social_posts
+    except ImportError as err:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Pipeline refresh requires ML/data dependencies not installed in this environment: {err}",
+        )
+
     try:
         raw_df = fetch_market_data(symbol=req.symbol, timeframe=req.timeframe, limit=req.limit)
         features_df = compute_market_features(raw_df)
 
-        global sentiment_analyzer
-        if sentiment_analyzer is None:
+        if sentiment_analyzer is None and FinBERTSentimentAnalyzer is not None:
             sentiment_analyzer = FinBERTSentimentAnalyzer()
+        if sentiment_analyzer is None:
+            raise HTTPException(
+                status_code=503,
+                detail="FinBERT sentiment analyzer is unavailable in this environment.",
+            )
 
         posts_df = generate_sample_social_posts()
         scored_posts = sentiment_analyzer.analyze_dataframe(posts_df, text_col="text")
@@ -330,843 +631,64 @@ def trigger_pipeline_refresh(req: PipelineRunRequest) -> Dict:
             df_sentiment=hourly_sentiment,
         )
 
-        global forecaster_model
-        if forecaster_model is None or not forecaster_model.is_trained:
+        if forecaster_model is None or not getattr(forecaster_model, "is_trained", False):
             from src.models.baseline import train_and_save_baseline
 
             forecaster_model, _ = train_and_save_baseline()
 
+        from datetime import datetime, timezone
+
+        last_pipeline_run = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         return {
             "success": True,
+            "timestamp": last_pipeline_run,
             "candles_fetched": len(raw_df),
             "market_features_rows": len(features_df),
             "sentiment_periods": len(hourly_sentiment),
             "aligned_features_shape": list(aligned_df.shape),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Mount built frontend assets if available
+if (FRONTEND_DIST_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST_DIR / "assets")), name="assets")
+
+
+def _serve_spa_index():
+    index_file = FRONTEND_DIST_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file, media_type="text/html")
+    return HTMLResponse(
+        content=(
+            "<!doctype html><html><body style='background:#0b0d12;color:#e5e7eb;font-family:sans-serif;padding:40px;'>"
+            "<h2>Frontend build not found</h2>"
+            "<p>Run <code>cd frontend && npm install && npm run build</code> to compile the UI.</p>"
+            "</body></html>"
+        ),
+        status_code=200,
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
-def serve_dashboard():
-    """Serves the interactive single-page dashboard."""
-    html_content = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quantitative Cryptocurrency Volatility Forecaster | Terminal</title>
-    <!-- Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Chart.js CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-
-        :root {
-            --bg: #090b10;
-            --surface: #10131a;
-            --surface-subtle: #141822;
-            --surface-inset: #0d1017;
-            --surface-hover: #181d2a;
-            --border: #1d2330;
-            --border-subtle: #161a24;
-            --border-active: #2f384d;
-            --border-focus: #3b82f6;
-            --text-primary: #f0f3f8;
-            --text-secondary: #86909f;
-            --text-tertiary: #525c6c;
-            --accent: #2563eb;
-            --accent-hover: #1d4ed8;
-            --accent-subtle: rgba(37, 99, 235, 0.12);
-            --positive: #10b981;
-            --negative: #f43f5e;
-            --warning: #f59e0b;
-        }
-
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background-color: var(--bg);
-            color: var(--text-primary);
-            background-image: 
-                linear-gradient(to right, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-                linear-gradient(to bottom, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
-            background-size: 32px 32px;
-            letter-spacing: -0.011em;
-            -webkit-font-smoothing: antialiased;
-        }
-
-        .font-mono {
-            font-family: 'JetBrains Mono', Consolas, monospace;
-            font-feature-settings: "tnum" 1;
-        }
-
-        .tabular-nums {
-            font-variant-numeric: tabular-nums;
-        }
-
-        /* Subtle hairline panels */
-        .panel {
-            background-color: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-        }
-
-        .panel-inset {
-            background-color: var(--surface-inset);
-            border: 1px solid var(--border-subtle);
-            border-radius: 3px;
-        }
-
-        /* Custom scrollbar */
-        ::-webkit-scrollbar {
-            width: 5px;
-            height: 5px;
-        }
-        ::-webkit-scrollbar-track {
-            background: var(--bg);
-        }
-        ::-webkit-scrollbar-thumb {
-            background: var(--border);
-            border-radius: 2px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: var(--border-active);
-        }
-
-        /* Input / select focus rings */
-        input:focus, select:focus, textarea:focus {
-            outline: 2px solid var(--border-focus);
-            outline-offset: -1px;
-            border-color: var(--border-focus) !important;
-        }
-
-        /* Micro transitions */
-        .transition-fast {
-            transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
-        }
-    </style>
-</head>
-<body class="min-h-screen flex flex-col">
-
-    <!-- Top Institutional Ticker & Navigation Bar -->
-    <header class="border-b border-[#1d2330] bg-[#0c0f16]/95 backdrop-blur-sm sticky top-0 z-50 px-5 py-2.5 flex items-center justify-between">
-        <div class="flex items-center space-x-4">
-            <div class="flex items-center gap-2.5">
-                <div class="h-6 px-1.5 rounded-[2px] bg-blue-950 border border-blue-800/80 flex items-center justify-center text-blue-400 font-mono text-[10px] font-bold tracking-widest">
-                    QVF
-                </div>
-                <div class="flex items-baseline gap-2">
-                    <span class="text-xs font-semibold tracking-tight text-white uppercase">Crypto Volatility Forecaster</span>
-                    <span class="text-[10px] text-[#86909f] hidden sm:inline">| Multimodal Econometrics & NLP</span>
-                </div>
-            </div>
-
-            <div class="hidden lg:flex items-center gap-1.5 pl-3 border-l border-[#1d2330] text-[11px] font-mono">
-                <span class="text-[#86909f]">PAIR:</span>
-                <span class="text-[#f0f3f8] font-semibold">BTC/USDT</span>
-                <span class="text-[#525c6c]">•</span>
-                <span class="text-[#86909f]">BAR:</span>
-                <span class="text-[#f0f3f8]">1-HOUR</span>
-                <span class="text-[#525c6c]">•</span>
-                <span class="text-[#86909f]">HORIZON:</span>
-                <span class="text-blue-400 font-semibold">FORWARD 4H</span>
-            </div>
-        </div>
-
-        <div class="flex items-center space-x-2.5">
-            <div class="flex items-center gap-1.5 px-2 py-1 rounded-[2px] bg-[#141822] border border-[#1d2330] text-[10px] font-mono text-[#86909f]">
-                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block"></span>
-                <span class="hidden md:inline">BINANCE CCXT:</span>
-                <span class="text-emerald-400 font-medium">LIVE</span>
-            </div>
-
-            <button onclick="refreshData()" class="px-2.5 py-1 text-xs font-medium rounded-[3px] bg-[#141822] hover:bg-[#1b212e] text-[#f0f3f8] border border-[#1d2330] hover:border-[#2f384d] transition-fast flex items-center gap-1.5">
-                <svg class="w-3 h-3 text-[#86909f]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                <span>Refresh</span>
-            </button>
-
-            <a href="/docs" target="_blank" class="px-2.5 py-1 text-xs font-medium rounded-[3px] bg-blue-600 hover:bg-blue-500 text-white transition-fast flex items-center gap-1">
-                <span>API Docs</span>
-                <span class="text-blue-200 text-[10px]">&nearr;</span>
-            </a>
-        </div>
-    </header>
-
-    <!-- Main Workspace -->
-    <main class="flex-1 p-5 max-w-[1400px] mx-auto w-full space-y-5">
-
-        <!-- Top Asymmetric Metric Strip: Historical Context + Target Volatility Focal Hero -->
-        <div class="grid grid-cols-1 md:grid-cols-12 gap-3.5">
-            
-            <!-- 1. Spot Price (Col 1-3) -->
-            <div class="md:col-span-3 panel p-3.5 flex flex-col justify-between">
-                <div>
-                    <div class="flex items-center justify-between text-[11px] font-medium text-[#86909f] uppercase tracking-wider">
-                        <span>BTC/USDT Spot</span>
-                        <span class="text-[10px] font-mono text-[#525c6c]">T-0</span>
-                    </div>
-                    <div class="text-2xl font-bold font-mono text-white mt-1 tabular-nums" id="stat-price">Loading...</div>
-                </div>
-                <div class="text-[11px] text-[#525c6c] mt-2 flex items-center gap-1 font-mono">
-                    <span>FEED:</span>
-                    <span class="text-[#86909f]">CONTINUOUS 1H OHLCV</span>
-                </div>
-            </div>
-
-            <!-- 2. Historical Realized Volatility (Col 4-6) -->
-            <div class="md:col-span-3 panel p-3.5 flex flex-col justify-between">
-                <div>
-                    <div class="flex items-center justify-between text-[11px] font-medium text-[#86909f] uppercase tracking-wider">
-                        <span>Historical Volatility (24H)</span>
-                        <span class="text-[10px] font-mono text-[#525c6c]">&sigma;<sub>24h</sub></span>
-                    </div>
-                    <div class="text-2xl font-bold font-mono text-amber-300 mt-1 tabular-nums" id="stat-hist-vol">Loading...</div>
-                </div>
-                <div class="text-[11px] text-[#525c6c] mt-2 font-mono">
-                    Sample standard deviation of log returns
-                </div>
-            </div>
-
-            <!-- 3. Primary Forecast Hero (Col 7-9: FOCAL POINT) -->
-            <div class="md:col-span-4 panel p-3.5 border-l-2 border-l-blue-500 bg-gradient-to-r from-blue-950/20 to-transparent flex flex-col justify-between">
-                <div>
-                    <div class="flex items-center justify-between text-[11px] font-medium uppercase tracking-wider">
-                        <span class="text-blue-400 font-semibold">Forecast Volatility (Next 4H)</span>
-                        <select id="modelSelect" onchange="fetchVolatilityMetrics()" class="bg-[#0d1017] border border-[#1d2330] text-[10px] text-[#f0f3f8] rounded-[2px] px-1.5 py-0.5 focus:outline-none font-mono">
-                            <option value="gru" selected>CryptoGRU (Deep)</option>
-                            <option value="lstm">CryptoLSTM (Deep)</option>
-                            <option value="ridge">Ridge (Baseline)</option>
-                        </select>
-                    </div>
-                    <div class="text-2xl font-bold font-mono text-blue-300 mt-1 tabular-nums" id="stat-forecast-vol">Loading...</div>
-                </div>
-                <div class="text-[11px] mt-2 text-[#86909f] flex items-center justify-between font-mono">
-                    <span id="stat-regime" class="font-medium text-[#f0f3f8]">Regime: Evaluating...</span>
-                    <span id="stat-model-badge" class="text-[10px] text-blue-400"></span>
-                </div>
-            </div>
-
-            <!-- 4. FinBERT Sentiment Composite (Col 10-12) -->
-            <div class="md:col-span-2 panel p-3.5 flex flex-col justify-between">
-                <div>
-                    <div class="flex items-center justify-between text-[11px] font-medium text-[#86909f] uppercase tracking-wider">
-                        <span>FinBERT Sentiment</span>
-                        <span class="text-[10px] font-mono text-[#525c6c]">NLP</span>
-                    </div>
-                    <div class="text-2xl font-bold font-mono mt-1 tabular-nums text-white" id="stat-sentiment">Loading...</div>
-                </div>
-                <div class="text-[10px] text-[#86909f] mt-2 font-mono truncate" id="stat-sentiment-sub">
-                    P(+) - P(-) Spread
-                </div>
-            </div>
-
-        </div>
-
-        <!-- Analytical Workbench: 65% Chart & Indicator Canvas + 35% Live FinBERT Inference -->
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-3.5">
-            
-            <!-- Left Stage: Hourly Time-Series Canvas (Col 1-8) -->
-            <div class="lg:col-span-8 panel p-4 space-y-3">
-                <div class="flex items-center justify-between">
-                    <div>
-                        <h2 class="text-xs font-semibold text-white uppercase tracking-wider">Price History & Bollinger Volatility Bands</h2>
-                        <p class="text-[11px] text-[#86909f]">20-period simple moving average with &plusmn;2&sigma; volatility envelope boundaries</p>
-                    </div>
-                    <span class="text-[11px] font-mono text-[#86909f] bg-[#141822] px-2 py-0.5 rounded-[2px] border border-[#1d2330]" id="chart-timestamp-range">-</span>
-                </div>
-                <div class="h-64 w-full">
-                    <canvas id="marketChart"></canvas>
-                </div>
-            </div>
-
-            <!-- Right Stage: Live FinBERT Inference Sandbox (Col 9-12) -->
-            <div class="lg:col-span-4 panel p-4 flex flex-col justify-between space-y-3">
-                <div>
-                    <div class="flex items-center justify-between">
-                        <h2 class="text-xs font-semibold text-white uppercase tracking-wider">Headline Sentiment Scorer</h2>
-                        <span class="text-[10px] font-mono text-blue-400 bg-blue-950/60 border border-blue-900 px-1.5 py-0.2 rounded-[2px]">ProsusAI/finbert</span>
-                    </div>
-                    <p class="text-[11px] text-[#86909f] mt-0.5">Evaluates probability distribution using pretrained financial BERT transformer.</p>
-                    
-                    <div class="mt-2.5">
-                        <textarea id="headlineInput" rows="3" class="w-full panel-inset p-2 text-xs text-[#f0f3f8] placeholder-[#525c6c] focus:outline-none font-sans" placeholder="e.g. Bitcoin holds support as institutional spot exchange volumes reach weekly peak..."></textarea>
-                    </div>
-
-                    <button onclick="analyzeCustomHeadline()" id="analyzeBtn" class="mt-2 w-full py-1.5 px-3 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white rounded-[3px] text-xs font-medium transition-fast flex items-center justify-center gap-1.5">
-                        <span>Evaluate Sentiment</span>
-                    </button>
-                </div>
-
-                <!-- Structured Probability Breakdown Panel -->
-                <div id="sentimentResult" class="panel-inset p-2.5 text-xs space-y-2">
-                    <div class="flex justify-between items-center text-[11px]">
-                        <span class="text-[#86909f]">Classification:</span>
-                        <span id="resLabel" class="font-mono font-medium text-white">Ready</span>
-                    </div>
-                    <div class="flex justify-between items-center text-[11px]">
-                        <span class="text-[#86909f]">Continuous Score [-1, +1]:</span>
-                        <span id="resScore" class="font-mono text-white">0.0000</span>
-                    </div>
-                    
-                    <!-- Class Probability Bars -->
-                    <div class="space-y-1 pt-1 border-t border-[#1d2330]">
-                        <div class="flex justify-between text-[10px] font-mono text-[#86909f]">
-                            <span>Pos: <b id="resPos" class="text-[#f0f3f8]">0%</b></span>
-                            <span>Neu: <b id="resNeu" class="text-[#f0f3f8]">0%</b></span>
-                            <span>Neg: <b id="resNeg" class="text-[#f0f3f8]">0%</b></span>
-                        </div>
-                        <div class="w-full bg-[#1b212e] h-1.5 rounded-[1px] overflow-hidden flex">
-                            <div id="barPos" class="bg-emerald-500 h-full transition-fast" style="width: 33%"></div>
-                            <div id="barNeu" class="bg-slate-500 h-full transition-fast" style="width: 34%"></div>
-                            <div id="barNeg" class="bg-rose-500 h-full transition-fast" style="width: 33%"></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-        </div>
-
-        <!-- Model Benchmark Evaluation Section -->
-        <div class="panel p-4 space-y-2.5">
-            <div class="flex items-center justify-between">
-                <div>
-                    <h2 class="text-xs font-semibold text-white uppercase tracking-wider">Model Benchmark Evaluation (Held-Out 15% Test Split)</h2>
-                    <p class="text-[11px] text-[#86909f]">Chronologically strictly unobserved sequence performance across loss metrics and directional accuracy</p>
-                </div>
-                <span class="text-[10px] bg-[#141822] text-[#86909f] border border-[#1d2330] px-2 py-0.5 rounded-[2px] font-mono">SPLIT: 70% TRAIN / 15% VAL / 15% TEST</span>
-            </div>
-
-            <div class="overflow-x-auto border border-[#1d2330] rounded-[3px]">
-                <table class="w-full text-left text-xs font-mono">
-                    <thead class="bg-[#0d1017] text-[#86909f] border-b border-[#1d2330]">
-                        <tr>
-                            <th class="p-2 font-medium">Model Architecture</th>
-                            <th class="p-2 font-medium">RMSE &darr;</th>
-                            <th class="p-2 font-medium">MAE &darr;</th>
-                            <th class="p-2 font-medium">MAPE (%)</th>
-                            <th class="p-2 font-medium">QLIKE Loss &darr;</th>
-                            <th class="p-2 font-medium">Pearson Corr &uarr;</th>
-                            <th class="p-2 font-medium text-blue-400">Directional Accuracy (%) &uarr;</th>
-                        </tr>
-                    </thead>
-                    <tbody id="benchmarkTableBody" class="divide-y divide-[#1d2330] text-[#f0f3f8]">
-                        <tr><td colspan="7" class="p-3 text-center text-[#525c6c]">Loading benchmark metrics...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- Factor Ablation & Volatility-Targeted Risk Simulation -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-3.5">
-            
-            <!-- Factor Ablation Card -->
-            <div class="panel p-4 space-y-3">
-                <div class="flex items-center justify-between">
-                    <div>
-                        <h2 class="text-xs font-semibold text-white uppercase tracking-wider">Multimodal Factor Ablation</h2>
-                        <p class="text-[11px] text-[#86909f]">Quantifying predictive contribution of FinBERT NLP over numerical technical signals</p>
-                    </div>
-                    <span class="text-[10px] bg-[#141822] text-[#86909f] border border-[#1d2330] px-1.5 py-0.5 rounded-[2px] font-mono">Permutation Analysis</span>
-                </div>
-                
-                <div class="overflow-x-auto border border-[#1d2330] rounded-[3px]">
-                    <table class="w-full text-left text-xs font-mono">
-                        <thead class="bg-[#0d1017] text-[#86909f] border-b border-[#1d2330]">
-                            <tr>
-                                <th class="p-2 font-medium">Feature Configuration</th>
-                                <th class="p-2 font-medium">RMSE &darr;</th>
-                                <th class="p-2 font-medium">QLIKE &darr;</th>
-                                <th class="p-2 font-medium text-blue-400">Dir Acc (%)</th>
-                            </tr>
-                        </thead>
-                        <tbody id="ablationTableBody" class="divide-y divide-[#1d2330] text-[#f0f3f8]">
-                            <tr><td colspan="4" class="p-3 text-center text-[#525c6c]">Loading ablation study...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-
-                <!-- Top Feature Drivers -->
-                <div class="pt-1">
-                    <span class="text-[10px] font-semibold text-[#86909f] uppercase tracking-wider">Top Permutation Feature Drivers:</span>
-                    <div id="topFeaturesContainer" class="flex flex-wrap gap-1.5 mt-1.5">
-                        <span class="text-xs text-[#525c6c]">Evaluating feature weights...</span>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Quantitative Risk Management Simulation Card -->
-            <div class="panel p-4 space-y-3">
-                <div class="flex items-center justify-between">
-                    <div>
-                        <h2 class="text-xs font-semibold text-white uppercase tracking-wider">Volatility-Targeted Risk Simulation</h2>
-                        <p class="text-[11px] text-[#86909f]">Dynamic exposure scaling: <code class="text-[#f0f3f8] font-mono">w_t = clip(&sigma;_target / &sigma;&#770;_t, 0.2, 1.5)</code></p>
-                    </div>
-                    <span class="text-[10px] bg-[#141822] text-[#86909f] border border-[#1d2330] px-1.5 py-0.5 rounded-[2px] font-mono">Risk Management</span>
-                </div>
-
-                <div class="grid grid-cols-2 gap-2.5 pt-0.5">
-                    <div class="panel-inset p-2.5">
-                        <span class="text-[10px] text-[#86909f] uppercase font-mono">Vol Reduction</span>
-                        <div class="text-xl font-bold font-mono text-emerald-400 mt-0.5 tabular-nums" id="btVolRed">-</div>
-                        <div class="text-[10px] text-[#525c6c]">vs Passive Buy & Hold</div>
-                    </div>
-                    <div class="panel-inset p-2.5">
-                        <span class="text-[10px] text-[#86909f] uppercase font-mono">Strategy Max Drawdown</span>
-                        <div class="text-xl font-bold font-mono text-blue-300 mt-0.5 tabular-nums" id="btMDD">-</div>
-                        <div class="text-[10px] text-[#525c6c]" id="btBnhMDD">B&H MDD: -</div>
-                    </div>
-                    <div class="panel-inset p-2.5">
-                        <span class="text-[10px] text-[#86909f] uppercase font-mono">Sharpe Ratio</span>
-                        <div class="text-xl font-bold font-mono text-white mt-0.5 tabular-nums" id="btSharpe">-</div>
-                        <div class="text-[10px] text-[#525c6c]" id="btBnhSharpe">B&H: -</div>
-                    </div>
-                    <div class="panel-inset p-2.5">
-                        <span class="text-[10px] text-[#86909f] uppercase font-mono">Periods Evaluated</span>
-                        <div class="text-xl font-bold font-mono text-[#f0f3f8] mt-0.5 tabular-nums" id="btPeriods">-</div>
-                        <div class="text-[10px] text-[#525c6c]">4-Hour Forward Steps</div>
-                    </div>
-                </div>
-            </div>
-
-        </div>
-
-        <!-- Aligned Multimodal Data Matrix -->
-        <div class="panel p-4 space-y-2.5">
-            <div class="flex items-center justify-between">
-                <div>
-                    <h2 class="text-xs font-semibold text-white uppercase tracking-wider">Synchronized Multimodal Training Matrix</h2>
-                    <p class="text-[11px] text-[#86909f]">Aligned numerical indicators with FinBERT sentiment shock and zero lookahead leakage</p>
-                </div>
-                <div class="text-[11px] text-[#86909f] font-mono">
-                    Target: <code class="text-blue-400 font-mono">&radic;(&Sigma; r<sub>t+1..t+4</sub>&sup2;)</code>
-                </div>
-            </div>
-
-            <div class="overflow-x-auto border border-[#1d2330] rounded-[3px]">
-                <table class="w-full text-left text-xs font-mono">
-                    <thead class="bg-[#0d1017] text-[#86909f] border-b border-[#1d2330]">
-                        <tr>
-                            <th class="p-2 font-medium">Timestamp</th>
-                            <th class="p-2 font-medium">Close</th>
-                            <th class="p-2 font-medium">Log Return</th>
-                            <th class="p-2 font-medium">RSI (14)</th>
-                            <th class="p-2 font-medium">MACD Hist</th>
-                            <th class="p-2 font-medium">Avg Sentiment</th>
-                            <th class="p-2 font-medium">Sentiment Shock</th>
-                            <th class="p-2 font-medium text-blue-400">4H Target Vol</th>
-                        </tr>
-                    </thead>
-                    <tbody id="featureTableBody" class="divide-y divide-[#1d2330] text-[#f0f3f8]">
-                        <tr><td colspan="8" class="p-3 text-center text-[#525c6c]">Loading aligned dataset...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- Academic Capstone Deliverables & Publication Figures -->
-        <div class="panel p-4 space-y-3">
-            <div class="flex items-center justify-between">
-                <div>
-                    <h2 class="text-xs font-semibold text-white uppercase tracking-wider">Academic Capstone Deliverables & Research Artifacts</h2>
-                    <p class="text-[11px] text-[#86909f]">Formal capstone paper, methodology validation, and high-resolution publication charts</p>
-                </div>
-                <div class="flex items-center gap-2">
-                    <button onclick="toggleReportViewer()" id="reportToggleBtn" class="px-2.5 py-1 text-xs font-medium rounded-[3px] bg-[#141822] hover:bg-[#1b212e] text-[#f0f3f8] border border-[#1d2330] hover:border-[#2f384d] transition-fast flex items-center gap-1.5">
-                        <svg class="w-3.5 h-3.5 text-[#86909f]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-                        <span>View Capstone Report</span>
-                    </button>
-                    <a href="/api/report" target="_blank" class="px-2.5 py-1 text-xs font-medium rounded-[3px] bg-[#141822] hover:bg-[#1b212e] text-[#86909f] hover:text-white border border-[#1d2330] transition-fast">
-                        <span>Raw JSON</span> &rarr;
-                    </a>
-                </div>
-            </div>
-
-            <!-- High-Resolution Publication Plates -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-3.5 pt-1">
-                <div class="panel-inset p-2.5 space-y-2">
-                    <div class="flex justify-between items-center text-[11px]">
-                        <span class="font-medium text-[#f0f3f8]">Figure 1: Benchmark Comparison</span>
-                        <a href="/api/report/charts/benchmark_comparison.png" target="_blank" class="text-[10px] text-blue-400 hover:underline font-mono">Full Res &nearr;</a>
-                    </div>
-                    <img src="/api/report/charts/benchmark_comparison.png" alt="Benchmark Comparison" class="w-full h-36 object-cover rounded-[2px] border border-[#1d2330] hover:opacity-90 transition-fast cursor-pointer" onclick="window.open(this.src)">
-                    <p class="text-[10px] text-[#86909f]">RMSE & Directional Accuracy across Ridge, LSTM, & GRU architectures.</p>
-                </div>
-
-                <div class="panel-inset p-2.5 space-y-2">
-                    <div class="flex justify-between items-center text-[11px]">
-                        <span class="font-medium text-[#f0f3f8]">Figure 2: Permutation Importance</span>
-                        <a href="/api/report/charts/feature_importance.png" target="_blank" class="text-[10px] text-blue-400 hover:underline font-mono">Full Res &nearr;</a>
-                    </div>
-                    <img src="/api/report/charts/feature_importance.png" alt="Feature Importance" class="w-full h-36 object-cover rounded-[2px] border border-[#1d2330] hover:opacity-90 transition-fast cursor-pointer" onclick="window.open(this.src)">
-                    <p class="text-[10px] text-[#86909f]">Relative QLIKE degradation quantifying market vs. NLP factor ranking.</p>
-                </div>
-
-                <div class="panel-inset p-2.5 space-y-2">
-                    <div class="flex justify-between items-center text-[11px]">
-                        <span class="font-medium text-[#f0f3f8]">Figure 3: Portfolio Backtest</span>
-                        <a href="/api/report/charts/backtest_equity_curve.png" target="_blank" class="text-[10px] text-blue-400 hover:underline font-mono">Full Res &nearr;</a>
-                    </div>
-                    <img src="/api/report/charts/backtest_equity_curve.png" alt="Backtest Equity Curve" class="w-full h-36 object-cover rounded-[2px] border border-[#1d2330] hover:opacity-90 transition-fast cursor-pointer" onclick="window.open(this.src)">
-                    <p class="text-[10px] text-[#86909f]">Volatility-targeting equity curve demonstrating drawdown compression.</p>
-                </div>
-            </div>
-
-            <!-- Collapsible Report Markdown Drawer -->
-            <div id="reportMarkdownContainer" class="hidden border-t border-[#1d2330] pt-3 mt-1">
-                <div class="bg-[#0b0e15] border border-[#1d2330] rounded-[3px] p-4 max-h-96 overflow-y-auto">
-                    <pre id="reportMarkdownText" class="text-xs font-mono text-[#f0f3f8] whitespace-pre-wrap">Loading capstone report markdown...</pre>
-                </div>
-            </div>
-        </div>
-
-    </main>
-
-    <!-- Institutional Footer -->
-    <footer class="border-t border-[#1d2330] py-3.5 px-6 text-center text-[11px] text-[#525c6c] font-mono">
-        QUANTITATIVE CRYPTOCURRENCY VOLATILITY FORECASTER &bull; UNDERGRADUATE CAPSTONE RESEARCH &bull; INSTITUTIONAL TIME-SERIES ARCHITECTURE
-    </footer>
-
-    <!-- Frontend Logic -->
-    <script>
-        let marketChart = null;
-
-        async function initDashboard() {
-            await Promise.all([
-                fetchVolatilityMetrics(),
-                fetchMarketHistory(),
-                fetchBenchmarkMetrics(),
-                fetchAblationMetrics(),
-                fetchBacktestMetrics()
-            ]);
-        }
-
-        async function fetchVolatilityMetrics() {
-            try {
-                const model = document.getElementById('modelSelect') ? document.getElementById('modelSelect').value : 'gru';
-                const res = await fetch('/api/predict/volatility?model=' + model);
-                if (!res.ok) throw new Error('Failed to fetch prediction');
-                const data = await res.json();
-
-                document.getElementById('stat-price').innerText = '$' + data.current_price.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-                document.getElementById('stat-hist-vol').innerText = (data.historical_24h_volatility * 100).toFixed(3) + '%';
-                document.getElementById('stat-forecast-vol').innerText = (data.forecast_next_4h_volatility * 100).toFixed(3) + '%';
-                document.getElementById('stat-regime').innerText = 'Regime: ' + data.volatility_regime;
-                if (document.getElementById('stat-model-badge')) {
-                    document.getElementById('stat-model-badge').innerText = 'Model: ' + data.model_used;
-                }
-
-                const sentEl = document.getElementById('stat-sentiment');
-                const score = data.latest_sentiment_score;
-                sentEl.innerText = score.toFixed(3);
-                if (score > 0.1) {
-                    sentEl.className = 'text-2xl font-bold font-mono mt-1 tabular-nums text-emerald-400';
-                    document.getElementById('stat-sentiment-sub').innerText = 'Bullish Sentiment (+)';
-                } else if (score < -0.1) {
-                    sentEl.className = 'text-2xl font-bold font-mono mt-1 tabular-nums text-rose-400';
-                    document.getElementById('stat-sentiment-sub').innerText = 'Bearish Sentiment (-)';
-                } else {
-                    sentEl.className = 'text-2xl font-bold font-mono mt-1 tabular-nums text-white';
-                    document.getElementById('stat-sentiment-sub').innerText = 'Neutral Sentiment (=)';
-                }
-            } catch (err) {
-                console.error('Error fetching volatility metrics:', err);
-            }
-        }
-
-        async function fetchBenchmarkMetrics() {
-            try {
-                const res = await fetch('/api/benchmark');
-                if (!res.ok) return;
-                const json = await res.json();
-                const records = json.records || [];
-                const tbody = document.getElementById('benchmarkTableBody');
-                if (!tbody) return;
-                tbody.innerHTML = '';
-
-                records.forEach(r => {
-                    const tr = document.createElement('tr');
-                    tr.className = 'hover:bg-[#161a24] transition-fast';
-                    const isBest = r.model.includes('GRU') || r.model.includes('Ridge');
-                    tr.innerHTML = `
-                        <td class="p-2 font-medium ${isBest ? 'text-blue-400 font-semibold' : 'text-[#f0f3f8]'}">${r.model}</td>
-                        <td class="p-2 text-[#86909f]">${r.rmse.toFixed(6)}</td>
-                        <td class="p-2 text-[#86909f]">${r.mae.toFixed(6)}</td>
-                        <td class="p-2 text-[#86909f]">${r.mape_pct.toFixed(2)}%</td>
-                        <td class="p-2 text-[#86909f]">${r.qlike_loss.toFixed(6)}</td>
-                        <td class="p-2 ${r.pearson_corr > 0 ? 'text-emerald-400' : 'text-rose-400'}">${r.pearson_corr.toFixed(4)}</td>
-                        <td class="p-2 font-semibold ${r.directional_accuracy_pct > 70 ? 'text-emerald-400' : 'text-[#86909f]'}">${r.directional_accuracy_pct.toFixed(1)}%</td>
-                    `;
-                    tbody.appendChild(tr);
-                });
-            } catch (err) {
-                console.error('Error fetching benchmarks:', err);
-            }
-        }
-
-        async function fetchAblationMetrics() {
-            try {
-                const res = await fetch('/api/ablation');
-                if (!res.ok) return;
-                const json = await res.json();
-                const ablRecords = json.ablation || [];
-                const impRecords = json.feature_importance || [];
-
-                const tbody = document.getElementById('ablationTableBody');
-                if (tbody) {
-                    tbody.innerHTML = '';
-                    ablRecords.forEach(r => {
-                        const tr = document.createElement('tr');
-                        tr.className = 'hover:bg-[#161a24] transition-fast';
-                        const isMulti = r.configuration.includes('Multimodal');
-                        tr.innerHTML = `
-                            <td class="p-2 font-medium ${isMulti ? 'text-blue-400 font-semibold' : 'text-[#f0f3f8]'}">${r.configuration}</td>
-                            <td class="p-2 text-[#86909f]">${r.rmse.toFixed(6)}</td>
-                            <td class="p-2 text-[#86909f]">${r.qlike_loss.toFixed(6)}</td>
-                            <td class="p-2 font-semibold ${r.directional_accuracy_pct > 80 ? 'text-emerald-400' : 'text-[#f0f3f8]'}">${r.directional_accuracy_pct.toFixed(1)}%</td>
-                        `;
-                        tbody.appendChild(tr);
-                    });
-                }
-
-                const featContainer = document.getElementById('topFeaturesContainer');
-                if (featContainer && impRecords.length > 0) {
-                    featContainer.innerHTML = '';
-                    impRecords.slice(0, 5).forEach(f => {
-                        const span = document.createElement('span');
-                        const isNlp = f.category.includes('NLP');
-                        span.className = `px-2 py-0.5 rounded-[2px] text-[10px] font-mono border ${isNlp ? 'bg-emerald-950/40 text-emerald-300 border-emerald-900/60' : 'bg-[#141822] text-blue-300 border-[#1d2330]'}`;
-                        span.innerText = `${f.feature} (${f.relative_importance_pct}%)`;
-                        featContainer.appendChild(span);
-                    });
-                }
-            } catch (err) {
-                console.error('Error fetching ablation metrics:', err);
-            }
-        }
-
-        async function fetchBacktestMetrics() {
-            try {
-                const res = await fetch('/api/backtest');
-                if (!res.ok) return;
-                const json = await res.json();
-                const s = json.summary || {};
-
-                if (document.getElementById('btVolRed') && s.volatility_reduction_pct !== undefined) {
-                    document.getElementById('btVolRed').innerText = (s.volatility_reduction_pct >= 0 ? '+' : '') + s.volatility_reduction_pct.toFixed(1) + '%';
-                }
-                if (document.getElementById('btMDD') && s.strategy_max_drawdown_pct !== undefined) {
-                    document.getElementById('btMDD').innerText = s.strategy_max_drawdown_pct.toFixed(1) + '%';
-                    document.getElementById('btBnhMDD').innerText = `B&H MDD: ${s.buy_and_hold_max_drawdown_pct.toFixed(1)}%`;
-                }
-                if (document.getElementById('btSharpe') && s.strategy_sharpe_ratio !== undefined) {
-                    document.getElementById('btSharpe').innerText = s.strategy_sharpe_ratio.toFixed(2);
-                    document.getElementById('btBnhSharpe').innerText = `B&H: ${s.buy_and_hold_sharpe_ratio.toFixed(2)}`;
-                }
-                if (document.getElementById('btPeriods') && s.total_periods !== undefined) {
-                    document.getElementById('btPeriods').innerText = s.total_periods;
-                }
-            } catch (err) {
-                console.error('Error fetching backtest metrics:', err);
-            }
-        }
-
-        async function fetchMarketHistory() {
-            try {
-                const res = await fetch('/api/market/latest?limit=30');
-                if (!res.ok) throw new Error('Failed to fetch market data');
-                const json = await res.json();
-                const records = json.records;
-
-                renderChart(records);
-                renderTable(records.slice(-8).reverse());
-            } catch (err) {
-                console.error('Error fetching market history:', err);
-            }
-        }
-
-        function renderChart(records) {
-            const labels = records.map(r => r.timestamp.slice(11, 16));
-            const closes = records.map(r => r.close);
-            const bbUpper = records.map(r => r.bb_upper);
-            const bbLower = records.map(r => r.bb_lower);
-
-            if (records.length > 0) {
-                document.getElementById('chart-timestamp-range').innerText = 
-                    `${records[0].timestamp.slice(5, 16)} → ${records[records.length-1].timestamp.slice(5, 16)}`;
-            }
-
-            const ctx = document.getElementById('marketChart').getContext('2d');
-            if (marketChart) marketChart.destroy();
-
-            marketChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        {
-                            label: 'BTC Close Price',
-                            data: closes,
-                            borderColor: '#38bdf8',
-                            backgroundColor: 'rgba(56, 189, 248, 0.04)',
-                            borderWidth: 1.5,
-                            tension: 0.1,
-                            pointRadius: 0,
-                            pointHoverRadius: 3,
-                            fill: false
-                        },
-                        {
-                            label: 'Bollinger Upper (+2σ)',
-                            data: bbUpper,
-                            borderColor: 'rgba(148, 163, 184, 0.3)',
-                            borderDash: [3, 3],
-                            borderWidth: 1,
-                            pointRadius: 0,
-                            fill: false
-                        },
-                        {
-                            label: 'Bollinger Lower (-2σ)',
-                            data: bbLower,
-                            borderColor: 'rgba(148, 163, 184, 0.3)',
-                            borderDash: [3, 3],
-                            borderWidth: 1,
-                            pointRadius: 0,
-                            fill: false
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { 
-                            position: 'top',
-                            align: 'end',
-                            labels: { color: '#86909f', boxWidth: 10, font: { family: 'JetBrains Mono', size: 10 } } 
-                        }
-                    },
-                    scales: {
-                        x: { 
-                            grid: { color: 'rgba(29, 35, 48, 0.6)' }, 
-                            ticks: { color: '#525c6c', font: { family: 'JetBrains Mono', size: 10 } } 
-                        },
-                        y: { 
-                            grid: { color: 'rgba(29, 35, 48, 0.6)' }, 
-                            ticks: { color: '#525c6c', font: { family: 'JetBrains Mono', size: 10 } } 
-                        }
-                    }
-                }
-            });
-        }
-
-        function renderTable(rows) {
-            const tbody = document.getElementById('featureTableBody');
-            tbody.innerHTML = '';
-            rows.forEach(r => {
-                const tr = document.createElement('tr');
-                tr.className = 'hover:bg-[#161a24] transition-fast';
-                const rsi = r.rsi_14 ? r.rsi_14.toFixed(1) : '-';
-                const logR = r.log_return ? (r.log_return * 100).toFixed(2) + '%' : '-';
-                const macdHist = r.macd_hist ? r.macd_hist.toFixed(2) : '-';
-                const avgSent = r.avg_sentiment !== undefined ? r.avg_sentiment.toFixed(3) : '-';
-                const shock = r.sentiment_shock !== undefined ? r.sentiment_shock.toFixed(3) : '-';
-                const volTarget = r.target_future_volatility ? (r.target_future_volatility * 100).toFixed(3) + '%' : 'Pending';
-
-                tr.innerHTML = `
-                    <td class="p-2 text-[#86909f]">${r.timestamp.slice(5, 16)}</td>
-                    <td class="p-2 font-medium text-white">$${r.close.toLocaleString()}</td>
-                    <td class="p-2 ${parseFloat(r.log_return) >= 0 ? 'text-emerald-400' : 'text-rose-400'}">${logR}</td>
-                    <td class="p-2 text-[#86909f]">${rsi}</td>
-                    <td class="p-2 text-[#86909f]">${macdHist}</td>
-                    <td class="p-2 ${parseFloat(avgSent) > 0 ? 'text-emerald-400' : parseFloat(avgSent) < 0 ? 'text-rose-400' : 'text-[#86909f]'}">${avgSent}</td>
-                    <td class="p-2 text-[#86909f]">${shock}</td>
-                    <td class="p-2 text-blue-400 font-semibold">${volTarget}</td>
-                `;
-                tbody.appendChild(tr);
-            });
-        }
-
-        async function analyzeCustomHeadline() {
-            const input = document.getElementById('headlineInput');
-            const text = input.value.trim();
-            if (!text) return;
-
-            const btn = document.getElementById('analyzeBtn');
-            btn.innerHTML = '<span>Evaluating FinBERT...</span>';
-            btn.disabled = true;
-
-            try {
-                const res = await fetch('/api/sentiment/analyze', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text: text })
-                });
-                if (!res.ok) throw new Error('Analysis failed');
-                const data = await res.json();
-
-                const pos = (data.probabilities.positive * 100).toFixed(1);
-                const neg = (data.probabilities.negative * 100).toFixed(1);
-                const neu = (data.probabilities.neutral * 100).toFixed(1);
-
-                document.getElementById('resLabel').innerText = data.label;
-                document.getElementById('resScore').innerText = data.sentiment_score.toFixed(4);
-                document.getElementById('resPos').innerText = pos + '%';
-                document.getElementById('resNeg').innerText = neg + '%';
-                document.getElementById('resNeu').innerText = neu + '%';
-
-                document.getElementById('barPos').style.width = pos + '%';
-                document.getElementById('barNeg').style.width = neg + '%';
-                document.getElementById('barNeu').style.width = neu + '%';
-
-                if (data.sentiment_score > 0.15) {
-                    document.getElementById('resLabel').className = 'font-mono font-semibold text-emerald-400';
-                } else if (data.sentiment_score < -0.15) {
-                    document.getElementById('resLabel').className = 'font-mono font-semibold text-rose-400';
-                } else {
-                    document.getElementById('resLabel').className = 'font-mono font-medium text-[#f0f3f8]';
-                }
-
-            } catch (err) {
-                alert('Error analyzing headline: ' + err.message);
-            } finally {
-                btn.innerHTML = '<span>Evaluate Sentiment</span>';
-                btn.disabled = false;
-            }
-        }
-
-        async function refreshData() {
-            await fetch('/api/pipeline/run', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ symbol: 'BTC/USDT', timeframe: '1h', limit: 100 })
-            });
-            await initDashboard();
-        }
-
-        async function toggleReportViewer() {
-            const container = document.getElementById('reportMarkdownContainer');
-            const btn = document.getElementById('reportToggleBtn');
-            if (container.classList.contains('hidden')) {
-                container.classList.remove('hidden');
-                btn.innerHTML = '<span>Hide Capstone Report</span>';
-                try {
-                    const res = await fetch('/api/report');
-                    const data = await res.json();
-                    document.getElementById('reportMarkdownText').innerText = data.content_markdown || 'Report content not available.';
-                } catch (e) {
-                    document.getElementById('reportMarkdownText').innerText = 'Failed to load report: ' + e.message;
-                }
-            } else {
-                container.classList.add('hidden');
-                btn.innerHTML = '<svg class="w-3.5 h-3.5 text-[#86909f]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg><span>View Capstone Report</span>';
-            }
-        }
-
-        window.onload = initDashboard;
-    </script>
-</body>
-</html>"""
-    return HTMLResponse(content=html_content)
+def serve_root():
+    """Serves the React SPA entrypoint."""
+    return _serve_spa_index()
+
+
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+def serve_spa_routes(full_path: str):
+    """SPA fallback for client-side routes while keeping API/docs paths 404 if unknown."""
+    if full_path.startswith(("api/", "docs", "redoc", "openapi.json")):
+        raise HTTPException(status_code=404, detail="Endpoint not found.")
+    candidate = FRONTEND_DIST_DIR / full_path
+    if candidate.is_file():
+        return FileResponse(candidate)
+    return _serve_spa_index()
 
 
 if __name__ == "__main__":

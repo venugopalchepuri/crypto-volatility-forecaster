@@ -1,7 +1,15 @@
 # ==============================================================================
 # Algorithmic Crypto Volatility Forecaster - Container Image
-# Multimodal Deep Learning (PyTorch + Hugging Face FinBERT) & FastAPI Dashboard
+# Multi-stage build: React/Vite Frontend + FastAPI & Multimodal PyTorch Backend
 # ==============================================================================
+
+FROM node:22-slim AS frontend-builder
+
+WORKDIR /app/frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
 
 FROM python:3.12-slim
 
@@ -19,12 +27,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install Python dependencies first for optimal Docker layer caching
-COPY requirements.txt .
+COPY requirements.txt requirements-ml.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt -r requirements-ml.txt
 
-# Copy application source code and pre-trained checkpoints
+# Copy application source code, pre-trained checkpoints, and built frontend
 COPY . .
+COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 
 # Expose FastAPI application port
 EXPOSE 8000

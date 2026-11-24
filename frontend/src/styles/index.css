@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+:root {
+  --bg-canvas: #0b0d11;
+  --bg-sidebar: #0e1116;
+  --bg-panel: #12151c;
+  --bg-inset: #0d1016;
+  --bg-hover: #181c26;
+  --border-subtle: #1c212c;
+  --border-default: #222834;
+  --border-strong: #2f3747;
+  --text-primary: #e8ecf2;
+  --text-secondary: #8d97a8;
+  --text-muted: #5a6475;
+  --accent: #3b82f6;
+  --accent-muted: rgba(59, 130, 246, 0.12);
+  --positive: #10b981;
+  --positive-muted: rgba(16, 185, 129, 0.12);
+  --negative: #ef4444;
+  --negative-muted: rgba(239, 68, 68, 0.12);
+  --warning: #f59e0b;
+  --warning-muted: rgba(245, 158, 11, 0.12);
+}
+
+.light {
+  --bg-canvas: #f4f6f8;
+  --bg-sidebar: #ffffff;
+  --bg-panel: #ffffff;
+  --bg-inset: #f8fafc;
+  --bg-hover: #eef2f6;
+  --border-subtle: #e5e9f0;
+  --border-default: #d8dee9;
+  --border-strong: #c2cad6;
+  --text-primary: #111827;
+  --text-secondary: #4b5563;
+  --text-muted: #6b7280;
+  --accent: #2563eb;
+  --accent-muted: rgba(37, 99, 235, 0.1);
+  --positive: #059669;
+  --positive-muted: rgba(5, 150, 105, 0.1);
+  --negative: #dc2626;
+  --negative-muted: rgba(220, 38, 38, 0.1);
+  --warning: #d97706;
+  --warning-muted: rgba(217, 119, 6, 0.1);
+}
+
+@layer base {
+  html {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    margin: 0;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.surface-panel {
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+}
+
+.surface-inset {
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+}
+
+/* Subtle institutional scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-canvas);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+/* Keyboard accessibility focus outline */
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
